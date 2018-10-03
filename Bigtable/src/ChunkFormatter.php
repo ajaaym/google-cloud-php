@@ -17,6 +17,7 @@
 
 namespace Google\Cloud\Bigtable;
 
+use Google\ApiCore\ApiException;
 use Google\ApiCore\ServerStream;
 use Google\Cloud\Bigtable\Exception\BigtableDataOperationException;
 use Google\Cloud\Bigtable\V2\ReadRowsResponse\CellChunk;
@@ -90,10 +91,53 @@ class ChunkFormatter implements \IteratorAggregate
      *
      * @param ServerStream $stream A server stream used to read rows.
      */
-    public function __construct(ServerStream $stream)
+    public function __construct(ExecutorWithRetry $executorWithRetry, $options)
     {
-        $this->stream = $stream;
         $this->reset();
+        $this->options = $options;
+        $this->executorWithRetry = $executorWithRetry;
+    }
+
+    private function retryArgument()
+    {
+        $modifiedOptions = [];
+        $lastRowKey = $this->prevRowKey;
+        $rowKeys = [];
+        if (isset($modifiedOptions['rowsLimit'])) {
+            $modifiedOptions['rowsLimit'] =
+                $modifiedOptions['rowsLimit'] - $this->numberOfRowsRead;
+        }
+        if (isset($modifiedOptions['rows'])) {
+            $rowSet = $modifiedOptions['rows'];
+            if (count($rowSet->getRowKeys) > 0) {
+                $rowKeys = array_filter(
+                    $rowset->getRowKeys(),
+                    function ($value) use ($lastRowKey) {
+                        return $value > $lastRowKey;
+                    }
+                );
+                $rowSet->setRowKeys($rowKeys);
+            } elseif (count($rowSet->getRowRanges()) > 0) {
+                $ranges = array_filter(
+                    $rowSet->getRowRanges(),
+                    function ($range) use ($lastRowKey) {
+                        return (!$range->getEndOpen() && !$range->getEndClose()) ||
+                            ($range->getEndOpen() > $lastRowKey) ||
+                            ($range->getEndClosed() > $lastRowKey);
+                    }
+                );
+                array_walk($ranges, function (&$range) {
+                    if (($range->getStartOpen() && $range->getStartOpen() < $lastRowKey) ||
+                        ($range->getStartClosed() && $range->getStartClosed() < $lastRowKey)) {
+                            $range->setStartOpen($lastRowKey);
+                    }
+                });
+                $rowSet->setRowRanges($ranges);
+            }
+        } else {
+            $range = (new RowRange)->setStartOpen($this->prevRowKey);
+            $modifiedOptions['rows'] = (new RowSet)->setRanges([$range]);
+        }
     }
 
     /**
@@ -116,28 +160,39 @@ class ChunkFormatter implements \IteratorAggregate
         //   this row are ok to consume.
         // - resetRow: This is a boolean telling us that all the previous chunks
         //   are to be discarded.
-        foreach ($this->stream->readAll() as $readRowsResponse) {
-            foreach ($readRowsResponse->getChunks() as $chunk) {
-                switch ($this->state) {
-                    case self::$rowStateEnum['NEW_ROW']:
-                        $this->newRow($chunk);
-                        break;
-                    case self::$rowStateEnum['ROW_IN_PROGRESS']:
-                        $this->rowInProgress($chunk);
-                        break;
-                    case self::$rowStateEnum['CELL_IN_PROGRESS']:
-                        $this->cellInProgress($chunk);
-                        break;
-                }
+        do {
+            try {
+                $this->stream = $this->executeRetryWithBackoff($this->options);
+                foreach ($this->stream->readAll() as $readRowsResponse) {
+                    foreach ($readRowsResponse->getChunks() as $chunk) {
+                        switch ($this->state) {
+                            case self::$rowStateEnum['NEW_ROW']:
+                                $this->newRow($chunk);
+                                break;
+                            case self::$rowStateEnum['ROW_IN_PROGRESS']:
+                                $this->rowInProgress($chunk);
+                                break;
+                            case self::$rowStateEnum['CELL_IN_PROGRESS']:
+                                $this->cellInProgress($chunk);
+                                break;
+                        }
 
-                if ($chunk->getCommitRow()) {
-                    $row = $this->row;
-                    $rowKey = $this->rowKey;
-                    $this->commit();
-                    yield $rowKey => $row;
+                        if ($chunk->getCommitRow()) {
+                            $row = $this->row;
+                            $rowKey = $this->rowKey;
+                            $this->commit();
+                            yield $rowKey => $row;
+                        }
+                    }
                 }
+                break;
+            } catch (ApiException $e) {
+                if (!$executorWithRetry->shouldRetry($e->getCode())) {
+                    throw $e;
+                }
+                $this->options = createNewOptions($this->options);
             }
-        }
+        } while (true);
 
         $this->onStreamEnd();
     }

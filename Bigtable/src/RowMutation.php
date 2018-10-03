@@ -17,13 +17,8 @@
 
 namespace Google\Cloud\Bigtable;
 
+use Google\Cloud\Bigtable\Mutation;
 use Google\Cloud\Bigtable\V2\MutateRowsRequest\Entry;
-use Google\Cloud\Bigtable\V2\Mutation;
-use Google\Cloud\Bigtable\V2\Mutation\DeleteFromColumn;
-use Google\Cloud\Bigtable\V2\Mutation\DeleteFromFamily;
-use Google\Cloud\Bigtable\V2\Mutation\DeleteFromRow;
-use Google\Cloud\Bigtable\V2\Mutation\SetCell;
-use Google\Cloud\Bigtable\V2\TimestampRange;
 
 /**
  * Represents a RowMutation to perform data operation on Bigtable table.
@@ -38,13 +33,14 @@ class RowMutation
     private $rowKey;
 
     /**
-     * @var array Mutation
+     * @var Mutation
      */
-    private $mutations = [];
+    private $mutation;
 
     public function __construct($rowKey, array $options = [])
     {
         $this->rowKey = $rowKey;
+        $this->mutation = new Mutation($options);
     }
 
     /**
@@ -69,23 +65,7 @@ class RowMutation
      */
     public function upsert($family, $qualifier, $value, $timeStamp = null)
     {
-        $mutation = new Mutation;
-        $mutationSetCell = new SetCell;
-        $mutationSetCell->setFamilyName($family)
-            ->setColumnQualifier($qualifier)
-            ->setValue($value);
-        if ($timeStamp === null) {
-            $mutationSetCell->setTimestampMicros(
-                // gives milli second
-                round(microtime(true) * 1000)
-                // multiply by 1000 to get micro
-                * 1000
-            );
-        } else {
-            $mutationSetCell->setTimestampMicros($timeStamp);
-        }
-        $mutation->setSetCell($mutationSetCell);
-        $this->mutations[] = $mutation;
+        $this->mutation->upsert($family, $qualifier, $value, $timeStamp);
         return $this;
     }
 
@@ -98,11 +78,7 @@ class RowMutation
      */
     public function deleteFromFamily($family)
     {
-        $mutation = new Mutation;
-        $deleteFromFamily = new DeleteFromFamily;
-        $deleteFromFamily->setFamilyName($family);
-        $mutation->setDeleteFromFamily($deleteFromFamily);
-        $this->mutations[] = $mutation;
+        $this->mutation->deleteFromFamily($family);
         return $this;
     }
 
@@ -117,17 +93,7 @@ class RowMutation
      */
     public function deleteFromColumn($family, $qualifier, array $timeRange = [])
     {
-        $mutation = new Mutation;
-        $deleteFromColumn = new DeleteFromColumn;
-        $deleteFromColumn->setFamilyName($family)->setColumnQualifier($qualifier);
-        if (!empty($timeRange)) {
-            $timestampRange = new TimestampRange;
-            $timestampRange->setStartTimestampMicros($timeRange['start']);
-            $timestampRange->setEndTimestampMicros($timeRange['end']);
-            $deleteFromColumn->setTimeRange($timestampRange);
-        }
-        $mutation->setDeleteFromColumn($deleteFromColumn);
-        $this->mutations[] = $mutation;
+        $this->mutation->deleteFromColumn($family, $qualifier, $timeRange);
         return $this;
     }
 
@@ -138,9 +104,7 @@ class RowMutation
      */
     public function deleteRow()
     {
-        $mutation = new Mutation;
-        $mutation->setDeleteFromRow(new DeleteFromRow);
-        $this->mutations[] = $mutation;
+        $this->mutation->deleteRow();
         return $this;
     }
 
@@ -149,11 +113,11 @@ class RowMutation
      *
      * @return Entry Entry for Row.
      */
-    public function getEntry()
+    public function toProto()
     {
         $mutateRowsRequestEntry = new Entry;
         $mutateRowsRequestEntry->setRowKey($this->rowKey);
-        $mutateRowsRequestEntry->setMutations($this->mutations);
+        $mutateRowsRequestEntry->setMutations($this->mutation->toProto());
         return $mutateRowsRequestEntry;
     }
 }

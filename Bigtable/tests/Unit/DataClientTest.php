@@ -70,12 +70,12 @@ class DataClientTest extends TestCase
         $this->dataClient = new DataClient(self::INSTANCE_ID, self::TABLE_ID, $clientOptions);
         $rowMutation = new RowMutation('rk1');
         $rowMutation->upsert('cf1', 'cq1', 'value1', self::TIMESTAMP);
-        $this->entries[] = $rowMutation->getEntry();
+        $this->entries[] = $rowMutation->toProto();
         $this->rowMutations[] = $rowMutation;
 
         $rowMutation = new RowMutation('rk2');
         $rowMutation->upsert('cf2', 'cq2', 'value2', self::TIMESTAMP);
-        $this->entries[] = $rowMutation->getEntry();
+        $this->entries[] = $rowMutation->toProto();
         $this->rowMutations[] = $rowMutation;
     }
 

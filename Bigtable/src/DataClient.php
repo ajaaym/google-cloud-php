@@ -142,30 +142,66 @@ class DataClient
     {
         $entries = [];
         foreach ($rowMutations as $rowMutation) {
-            $entries[] = $rowMutation->getEntry();
+            $entries[] = $rowMutation->toProto();
         }
-        $responseStream = $this->bigtableClient->mutateRows($this->tableName, $entries, $options + $this->options);
-        $rowMutationsFailedResponse = [];
-        $failureCode = Code::OK;
-        $message = 'partial failure';
-        foreach ($responseStream->readAll() as $mutateRowsResponse) {
-            $mutateRowsResponseEntries = $mutateRowsResponse->getEntries();
-            foreach ($mutateRowsResponseEntries as $mutateRowsResponseEntry) {
-                if ($mutateRowsResponseEntry->getStatus()->getCode() !== Code::OK) {
-                    $failureCode = $mutateRowsResponseEntry->getStatus()->getCode();
-                    $message = $mutateRowsResponseEntry->getStatus()->getMessage();
-                    $rowMutationsFailedResponse[] = [
-                        'rowKey' => $rowMutations[$mutateRowsResponseEntry->getIndex()]->getRowKey(),
-                        'rowMutationIndex' => $mutateRowsResponseEntry->getIndex(),
-                        'statusCode' => $failureCode,
-                        'message' => $message
+        $entryIndexToOriginalEntryIndex = array_keys($entries);
+        $pendingEntries = $entries;
+        $callable = function () use (&$pendingEntries, &$entryIndexToOriginalEntryIndex) {
+            $failedMutations = [];
+            $statusCode = Code::OK;
+            try {
+                $responseStream = $this->bigtableClient->mutateRows(
+                    $this->tableName,
+                    $entries,
+                    $options + $this->options
+                );
+                foreach ($responseStream->readAll() as $mutateRowsResponse) {
+                    $mutateRowsResponseEntries = $mutateRowsResponse->getEntries();
+                    foreach ($mutateRowsResponseEntries as $mutateRowsResponseEntry) {
+                        if ($mutateRowsResponseEntry->getStatus()->getCode() !== Code::OK) {
+                            if ($statusCode === Code::OK || $mutateRowsResponseEntry->getIndex()) {
+                                $statusCode = $mutateRowsResponseEntry->getIndex();
+                            }
+                            $index = $mutateRowsResponseEntry->getIndex();
+                            $failedMutations[] = [
+                                'rowKey' => $entries[$entryIndexToOriginalEntryIndex[$index]]->getRowKey(),
+                                'rowMutationIndex' =>  $entryIndexToOriginalEntryIndex[$index],
+                                'statusCode' => $mutateRowsResponseEntry->getStatus()->getCode()
+                            ];
+                        }
+                        unset($entries[$mutateRowsResponseEntry->getIndex()]);
+                    }
+                }
+                if (count($failedMutations) === 0) {
+                    return;
+                }
+            } catch (ApiException $e) {
+                foreach ($entries as $index => $entry) {
+                    $failedMutations[] = [
+                        'rowKey' => $entry->getRowKey(),
+                        'rowMutationIndex' => $entryIndexToOriginalEntryIndex[$index],
+                        'statusCode' => $e->getStatus()
                     ];
                 }
             }
-        }
-        if (!empty($rowMutationsFailedResponse)) {
-            throw new BigtableDataOperationException($message, $failureCode, $rowMutationsFailedResponse);
-        }
+            throw new BigtableDataOperationException('partial failure', $statusCode, $failedMutations);
+        };
+        $maxRetries = $this->pluck('maxRetries', $options, false) ?: $this->maxRetries;
+        $executorWithRetry = new ExecutorWithRetry($callable);
+        while (true) {
+            try {
+                $executorWithRetry->executeRetryWithBackoff();
+                return;
+            } catch (BigtableDataOperationException $e) {
+                if (!$executorWithRetry->shouldRetry($e->getCode())) {
+                    throw $e;
+                }
+                foreach ($e['failedMutations'] as $failedMutation) {
+                    $pendingEntries[] = $entires[$failedMutation['rowMutationIndex']];
+                    $entryIndexToOriginalEntryIndex[] = $failedMutation['rowMutationIndex'];
+                }
+            }
+        };
     }
 
     /**
@@ -290,12 +326,13 @@ class DataClient
             }
             $options['filter'] = $filter->toProto();
         }
-
-        $serverStream = $this->bigtableClient->readRows(
-            $this->tableName,
-            $options + $this->options
-        );
-        return new ChunkFormatter($serverStream);
+        $callable = function ($options) {
+            return $this->bigtableClient->readRows(
+                $this->tableName,
+                $options + $this->options
+            );
+        };
+        return new ChunkFormatter(new ExecutorWithRetry($callable.bindTo($this), $options));
     }
 
     /**
